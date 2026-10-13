@@ -223,6 +223,167 @@ def ao_overlap(mol: gto.Mole) -> np.ndarray:
     return overlap
 
 
+def _to_mol_shell_order(angular: int, shell_cart: np.ndarray) -> np.ndarray:
+    '''
+    Convert Cartesian shell values to molecular shell order.
+    Args:
+        angular: Angular momentum.
+        shell_cart: Cartesian shell values.
+    Returns:
+        Shell values in molecular shell order.
+    '''
+    cart2sph = np.asarray(gto.cart2sph(angular), dtype=float)
+    shell_values = np.einsum("cs,cnp->nsp", cart2sph, shell_cart)
+
+    return shell_values.reshape(-1, shell_cart.shape[2])
+
+
+def primitive_pw_moment(alpha: float, center: np.ndarray, powers: tuple[int, int, int], 
+                         pw_k: np.ndarray) -> np.ndarray:
+    '''
+    Calculate the primitive plane wave moment.
+    Args:
+        alpha: Exponent of the Gaussian function.
+        center: Center of the Gaussian function.
+        powers: Cartesian powers.
+        pw_k: Plane wave vectors.
+    Returns:
+        Value of the primitive plane wave moment.
+    '''
+    def _moment_1d(power: int, k: np.ndarray, alpha: float) -> np.ndarray:
+        moments = [sqrt(pi / alpha) * np.exp(-(k * k) / (4.0 * alpha)) + 0.j]
+        if power == 0:
+            return moments[0]
+
+        moments.append(1j * k * moments[0] / (2.0 * alpha))
+        for order in range(1, power):
+            moments.append((order * moments[order - 1] + 1j * k * moments[order]) / (2.0 * alpha))
+
+        #vv imam: It only returns the last element of moments, it would be more efficient
+        #         if it returns all elements already calculated before arriving at the power-th
+        #         element.
+        return moments[power]
+
+    phase = np.exp(1j * np.einsum("pi,i->p", pw_k, center))
+    moment_x = _moment_1d(powers[0], pw_k[:, 0], alpha)
+    moment_y = _moment_1d(powers[1], pw_k[:, 1], alpha)
+    moment_z = _moment_1d(powers[2], pw_k[:, 2], alpha)
+
+    return phase * moment_x * moment_y * moment_z
+
+
+def ao_pw_ovlp(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0) -> np.ndarray:
+
+    '''
+    Calculate the overlap integral of the plane wave with the Gaussian basis functions.
+    Args:
+        mol: PySCF molecule object.
+        pw_k: Plane wave vectors.
+        pw_norm: Normalization factor for the plane waves.
+    Returns:
+        Overlap integral matrix.
+    '''
+    num_pw = pw_k.shape[0]
+    ao_pw = np.zeros((mol.nao_nr(), num_pw), dtype=complex)
+    ao_loc = mol.ao_loc_nr()
+
+    #vv imam: Loop over contractions (shells).
+    for shell_id in range(mol.nbas):
+        angular = mol.bas_angular(shell_id)
+        atom_id = mol.bas_atom(shell_id)
+        center = np.asarray(mol.atom_coord(atom_id), dtype=float)
+        exponents = np.asarray(mol.bas_exp(shell_id), dtype=float)
+        coefficients = np.asarray(mol.bas_ctr_coeff(shell_id), dtype=float)
+        #^^imam: not sure why need np.asarray, mol.bas_ctr_coeff returns an array already.
+        coefficients *= gto.gto_norm(angular, exponents)[:, None]
+    
+        powers_list = _cartesian_powers(angular)
+        shell_cart = np.zeros((len(powers_list), coefficients.shape[1], num_pw), dtype=complex)
+        #imam print('l = ', angular)
+        #imam print('  powers = ', powers_list)
+        #imam print("  shell_cart.shape = ", shell_cart.shape)
+        #vv imam: Loop over primitive Gaussians making up the current contraction.
+        for prim_id, alpha in enumerate(exponents):
+            for cart_id, powers in enumerate(powers_list):
+                prim = primitive_pw_moment(alpha, center, powers, pw_k)
+                shell_cart[cart_id] += coefficients[prim_id, :, None] * prim[None, :]
+                #^^imam: coefficients[prim_id, :] and prim[:] are vectors and we want to get their outer product.
+                #        It could also be achieved with with
+                #        shell_cart[cart_id] += np.outer(coefficients[prim_id, :], prim[:]).
+                #print('a, b ', coefficients[prim_id, :, None].shape, prim[None, :].shape)
+    
+        start, stop = int(ao_loc[shell_id]), int(ao_loc[shell_id + 1])
+        ao_pw[start:stop] = _to_mol_shell_order(angular, shell_cart)
+    
+    return pw_norm * ao_pw
+
+
+
+def ao_pw_pot(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0) -> np.ndarray:
+    def _primitive_nuclear(alpha: float, center: np.ndarray, powers: tuple[int, int, int],
+                           charge: float, nuc_center: np.ndarray) -> np.ndarray:
+        '''
+        Calculate the primitive nuclear integral.
+        Args:
+            alpha: Exponent of the Gaussian function.
+            center: Center of the Gaussian function.
+            powers: Angular momentum powers (lx, ly, lz).
+            charge: Nuclear charge.
+            nuc_center: Center of the nucleus.
+        Returns:
+            Primitive nuclear integral.
+        '''
+        k2 = np.einsum("pi,pi->p", pw_k, pw_k)
+        complex_center = center[None, :] + 1j * pw_k / (2.0 * alpha)
+        center_shift = complex_center - center[None, :]
+        pc = complex_center - nuc_center[None, :]
+        boys_arg = alpha * np.einsum("pi,pi->p", pc, pc)
+        phase = np.exp(1j * np.einsum("pi,i->p", pw_k, center) - k2 / (4.0 * alpha))
+
+        coeff_x = _shifted_hermite_coeff(powers[0], center_shift[:, 0], alpha)
+        coeff_y = _shifted_hermite_coeff(powers[1], center_shift[:, 1], alpha)
+        coeff_z = _shifted_hermite_coeff(powers[2], center_shift[:, 2], alpha)
+        prefactor = 2.0 * pi / alpha
+
+        value = np.zeros(pw_k.shape[0], dtype=complex)
+        for tx, cx in enumerate(coeff_x):
+            for ty, cy in enumerate(coeff_y):
+                coeff_xy = cx * cy
+                for tz, cz in enumerate(coeff_z):
+                    value += coeff_xy * cz * prefactor * _hermite_coulomb(tx, ty, tz, 0, alpha, pc, boys_arg)
+
+        return -charge * phase * value
+
+    num_pw = pw_k.shape[0]
+    ao_pw = np.zeros((mol.nao_nr(), num_pw), dtype=complex)
+    ao_loc = mol.ao_loc_nr()
+    atom_coords = [np.asarray(mol.atom_coord(i), dtype=float) for i in range(mol.natm)]
+    atom_charges = [float(mol.atom_charge(i)) for i in range(mol.natm)]
+    
+    for shell_id in range(mol.nbas):
+        angular = mol.bas_angular(shell_id)
+        atom_id = mol.bas_atom(shell_id)
+        center = np.asarray(mol.atom_coord(atom_id), dtype=float)
+        exponents = np.asarray(mol.bas_exp(shell_id), dtype=float)
+        coefficients = np.asarray(mol.bas_ctr_coeff(shell_id), dtype=float)
+        coefficients *= gto.gto_norm(angular, exponents)[:, None]
+    
+        powers_list = _cartesian_powers(angular)
+        shell_cart = np.zeros((len(powers_list), coefficients.shape[1], num_pw), dtype=complex)
+        for prim_id, alpha in enumerate(exponents):
+            for cart_id, powers in enumerate(powers_list):
+                prim = np.zeros(num_pw, dtype=complex)
+                for nuc_id in range(mol.natm):
+                    prim += _primitive_nuclear(alpha, center, powers, atom_charges[nuc_id],
+                                              atom_coords[nuc_id])
+                shell_cart[cart_id] += coefficients[prim_id, :, None] * prim[None, :]
+    
+        start, stop = int(ao_loc[shell_id]), int(ao_loc[shell_id + 1])
+        ao_pw[start:stop] = _to_mol_shell_order(angular, shell_cart)
+    
+    return pw_norm * ao_pw
+        
+
 def int_1e(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0, op: str = "i") -> np.ndarray:
     '''
     calculate the integral of the plane wave with the Gaussian basis functions
@@ -235,96 +396,6 @@ def int_1e(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0, op: str = "i")
     num_pw, _ = pw_k.shape
     num_basis = num_ao + num_pw
 
-    def _to_mol_shell_order(angular: int, shell_cart: np.ndarray) -> np.ndarray:
-        '''
-        Convert Cartesian shell values to molecular shell order.
-        Args:
-            angular: Angular momentum.
-            shell_cart: Cartesian shell values.
-        Returns:
-            Shell values in molecular shell order.
-        '''
-        cart2sph = np.asarray(gto.cart2sph(angular), dtype=float)
-        shell_values = np.einsum("cs,cnp->nsp", cart2sph, shell_cart)
-
-        return shell_values.reshape(-1, shell_cart.shape[2])
-
-    def _primitive_pw_moment(alpha: float, center: np.ndarray, powers: tuple[int, int, int], 
-                             pw_k: np.ndarray) -> np.ndarray:
-        '''
-        Calculate the primitive plane wave moment.
-        Args:
-            alpha: Exponent of the Gaussian function.
-            center: Center of the Gaussian function.
-            powers: Cartesian powers.
-            pw_k: Plane wave vectors.
-        Returns:
-            Value of the primitive plane wave moment.
-        '''
-        def _moment_1d(power: int, k: np.ndarray, alpha: float) -> np.ndarray:
-            moments = [sqrt(pi / alpha) * np.exp(-(k * k) / (4.0 * alpha)) + 0.j]
-            if power == 0:
-                return moments[0]
-
-            moments.append(1j * k * moments[0] / (2.0 * alpha))
-            for order in range(1, power):
-                moments.append((order * moments[order - 1] + 1j * k * moments[order]) / (2.0 * alpha))
-
-            #vv imam: It only returns the last element of moments, it would be more efficient
-            #         if it returns all elements already calculated before arriving at the power-th
-            #         element.
-            return moments[power]
-
-        phase = np.exp(1j * np.einsum("pi,i->p", pw_k, center))
-        moment_x = _moment_1d(powers[0], pw_k[:, 0], alpha)
-        moment_y = _moment_1d(powers[1], pw_k[:, 1], alpha)
-        moment_z = _moment_1d(powers[2], pw_k[:, 2], alpha)
-    
-        return phase * moment_x * moment_y * moment_z
-
-    def _ao_pw_ovlp(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0) -> np.ndarray:
-        '''
-        Calculate the overlap integral of the plane wave with the Gaussian basis functions.
-        Args:
-            mol: PySCF molecule object.
-            pw_k: Plane wave vectors.
-            pw_norm: Normalization factor for the plane waves.
-        Returns:
-            Overlap integral matrix.
-        '''
-        ao_pw = np.zeros((num_ao, num_pw), dtype=complex)
-        ao_loc = mol.ao_loc_nr()
-
-        #vv imam: Loop over contractions (shells).
-        for shell_id in range(mol.nbas):
-            angular = mol.bas_angular(shell_id)
-            atom_id = mol.bas_atom(shell_id)
-            center = np.asarray(mol.atom_coord(atom_id), dtype=float)
-            exponents = np.asarray(mol.bas_exp(shell_id), dtype=float)
-            coefficients = np.asarray(mol.bas_ctr_coeff(shell_id), dtype=float)
-            #^^imam: not sure why need np.asarray, mol.bas_ctr_coeff returns an array already.
-            coefficients *= gto.gto_norm(angular, exponents)[:, None]
-    
-            powers_list = _cartesian_powers(angular)
-            shell_cart = np.zeros((len(powers_list), coefficients.shape[1], num_pw), dtype=complex)
-            #imam print('l = ', angular)
-            #imam print('  powers = ', powers_list)
-            #imam print("  shell_cart.shape = ", shell_cart.shape)
-            #vv imam: Loop over primitive Gaussians making up the current contraction.
-            for prim_id, alpha in enumerate(exponents):
-                for cart_id, powers in enumerate(powers_list):
-                    prim = _primitive_pw_moment(alpha, center, powers, pw_k)
-                    shell_cart[cart_id] += coefficients[prim_id, :, None] * prim[None, :]
-                    #^^imam: coefficients[prim_id, :] and prim[:] are vectors and we want to get their outer product.
-                    #        It could also be achieved with with
-                    #        shell_cart[cart_id] += np.outer(coefficients[prim_id, :], prim[:]).
-                    #print('a, b ', coefficients[prim_id, :, None].shape, prim[None, :].shape)
-    
-            start, stop = int(ao_loc[shell_id]), int(ao_loc[shell_id + 1])
-            ao_pw[start:stop] = _to_mol_shell_order(angular, shell_cart)
-    
-        return pw_norm * ao_pw
-
     def _int_ovlp() -> np.ndarray:
         ovlp = np.zeros((num_basis, num_basis), dtype=complex)
     
@@ -332,7 +403,7 @@ def int_1e(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0, op: str = "i")
 
         ovlp[num_ao:, num_ao:] = np.eye(num_pw)
     
-        ao_pw = _ao_pw_ovlp(mol, pw_k, pw_norm)
+        ao_pw = ao_pw_ovlp(mol, pw_k, pw_norm)
         ovlp[:num_ao, num_ao:] = ao_pw
         ovlp[num_ao:, :num_ao] = ovlp[:num_ao, num_ao:].conj().T
     
@@ -346,76 +417,13 @@ def int_1e(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0, op: str = "i")
         pw_kin = 0.5 * np.einsum("pi,pi->p", pw_k, pw_k)
         kin[num_ao:, num_ao:] = np.diag(pw_kin)
 
-        ao_pw_overlap = _ao_pw_ovlp(mol, pw_k, pw_norm)
+        ao_pw_overlap = ao_pw_ovlp(mol, pw_k, pw_norm)
         kin[:num_ao, num_ao:] = ao_pw_overlap * pw_kin[None, :]
         kin[num_ao:, :num_ao] = kin[:num_ao, num_ao:].conj().T
 
         return kin
 
     def _int_pot() -> np.ndarray:
-        def _ao_pw_pot() -> np.ndarray:
-            def _primitive_nuclear(alpha: float, center: np.ndarray, powers: tuple[int, int, int], 
-                                   charge: float, nuc_center: np.ndarray) -> np.ndarray:
-                '''
-                Calculate the primitive nuclear integral.
-                Args:
-                    alpha: Exponent of the Gaussian function.
-                    center: Center of the Gaussian function.
-                    powers: Angular momentum powers (lx, ly, lz).
-                    charge: Nuclear charge.
-                    nuc_center: Center of the nucleus.
-                Returns:
-                    Primitive nuclear integral.
-                '''
-                k2 = np.einsum("pi,pi->p", pw_k, pw_k)
-                complex_center = center[None, :] + 1j * pw_k / (2.0 * alpha)
-                center_shift = complex_center - center[None, :]
-                pc = complex_center - nuc_center[None, :]
-                boys_arg = alpha * np.einsum("pi,pi->p", pc, pc)
-                phase = np.exp(1j * np.einsum("pi,i->p", pw_k, center) - k2 / (4.0 * alpha))
-
-                coeff_x = _shifted_hermite_coeff(powers[0], center_shift[:, 0], alpha)
-                coeff_y = _shifted_hermite_coeff(powers[1], center_shift[:, 1], alpha)
-                coeff_z = _shifted_hermite_coeff(powers[2], center_shift[:, 2], alpha)
-                prefactor = 2.0 * pi / alpha
-
-                value = np.zeros(pw_k.shape[0], dtype=complex)
-                for tx, cx in enumerate(coeff_x):
-                    for ty, cy in enumerate(coeff_y):
-                        coeff_xy = cx * cy
-                        for tz, cz in enumerate(coeff_z):
-                            value += coeff_xy * cz * prefactor * _hermite_coulomb(tx, ty, tz, 0, alpha, pc, boys_arg)
-
-                return -charge * phase * value
-
-            ao_pw = np.zeros((num_ao, num_pw), dtype=complex)
-            ao_loc = mol.ao_loc_nr()
-            atom_coords = [np.asarray(mol.atom_coord(i), dtype=float) for i in range(mol.natm)]
-            atom_charges = [float(mol.atom_charge(i)) for i in range(mol.natm)]
-    
-            for shell_id in range(mol.nbas):
-                angular = mol.bas_angular(shell_id)
-                atom_id = mol.bas_atom(shell_id)
-                center = np.asarray(mol.atom_coord(atom_id), dtype=float)
-                exponents = np.asarray(mol.bas_exp(shell_id), dtype=float)
-                coefficients = np.asarray(mol.bas_ctr_coeff(shell_id), dtype=float)
-                coefficients *= gto.gto_norm(angular, exponents)[:, None]
-    
-                powers_list = _cartesian_powers(angular)
-                shell_cart = np.zeros((len(powers_list), coefficients.shape[1], num_pw), dtype=complex)
-                for prim_id, alpha in enumerate(exponents):
-                    for cart_id, powers in enumerate(powers_list):
-                        prim = np.zeros(num_pw, dtype=complex)
-                        for nuc_id in range(mol.natm):
-                            prim += _primitive_nuclear(alpha, center, powers, atom_charges[nuc_id],
-                                                      atom_coords[nuc_id])
-                        shell_cart[cart_id] += coefficients[prim_id, :, None] * prim[None, :]
-    
-                start, stop = int(ao_loc[shell_id]), int(ao_loc[shell_id + 1])
-                ao_pw[start:stop] = _to_mol_shell_order(angular, shell_cart)
-    
-            return pw_norm * ao_pw
-
         def _pw_pw_pot() -> np.ndarray:
             delta_k, delta_k2 = _pw_pair_transfer(pw_k)
             pw_pw = np.zeros(delta_k2.shape, dtype=complex)
@@ -434,7 +442,7 @@ def int_1e(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0, op: str = "i")
         pot[:num_ao, :num_ao] = mol.intor('int1e_nuc_sph', hermi=1)
 
         pot[num_ao:, num_ao:] = _pw_pw_pot()
-        pot[:num_ao, num_ao:] = _ao_pw_pot()
+        pot[:num_ao, num_ao:] = ao_pw_pot(mol, pw_k, pw_norm)
 
         pot[num_ao:, :num_ao] = pot[:num_ao, num_ao:].conj().T
 
@@ -457,14 +465,14 @@ def int_1e(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0, op: str = "i")
                 shell_cart = np.zeros((3, len(powers_list), coefficients.shape[1], num_pw), dtype=complex)
                 for prim_id, alpha in enumerate(exponents):
                     for cart_id, powers in enumerate(powers_list):
-                        base = _primitive_pw_moment(alpha, center, powers, pw_k)
+                        base = primitive_pw_moment(alpha, center, powers, pw_k)
                         shifted_powers = (
                             (powers[0] + 1, powers[1], powers[2]),
                             (powers[0], powers[1] + 1, powers[2]),
                             (powers[0], powers[1], powers[2] + 1),
                         )
                         for axis, axis_powers in enumerate(shifted_powers):
-                            prim = _primitive_pw_moment(alpha, center, axis_powers, pw_k)
+                            prim = primitive_pw_moment(alpha, center, axis_powers, pw_k)
                             prim += center[axis] * base
                             shell_cart[axis, cart_id] += coefficients[prim_id, :, None] * prim[None, :]
 
@@ -783,6 +791,8 @@ def int_2e(mol: gto.Mole, pw_k: np.ndarray, int2e_types: tuple[str, ...],
 
         value = np.zeros((num_pw, num_pw, num_pw, num_pw), dtype=complex)
         value[nonzero] = pw_norm * pw_norm * 4.0 * pi / delta_k2[nonzero]
+        print('Check again why there are only two pw_norm being multiplied above instead of four.')
+        quit()
 
         return value, canonical
 
@@ -1381,6 +1391,20 @@ def int2e_ao2mo(mo_coeff: np.ndarray, int2e_ao: list[INT2e], ao_num: int, pw_num
 
 
 
+def get_pqrs_id(p, q, r, s, nq, nr, ns):
+    return p*nq*nr*ns + q*nr*ns + r*ns + s
+
+
+def sort_int2e(int2e, norb):
+    pqrs_id = []
+    for i, g in enumerate(int2e):
+        p, q, r, s = g.index
+        nu = get_pqrs_id(p, q, r, s, norb, norb, norb)
+        #^^ p, q, r, and s vary as s => r => q => p.
+        kbbb_id += [nu]
+    return np.argsort(pqrs_id)
+
+
 def get_kbbb_id(num_ao, p, q, r, s, n_rs=None):
     '''
     Returns a composite index from a 4-number index that corresponds to a kbbb type. The
@@ -1413,9 +1437,10 @@ def get_kbbb_id(num_ao, p, q, r, s, n_rs=None):
 
 def sort_kbbb(int2e, num_ao):
     '''
-    Sorts elements of int2e so that its indices are monotonically increasing, with the last
-    index moving fastest and the first index moving slowest. It returns the indices that
-    would sort int2e in the above manner.
+    Sorts elements a list containing kbbb-type integrals, (P_k G_a|G_b G_c), so that
+    their indices are monotonically increasing, c moving fastest and k moving slowest.
+    The input list must only contain integrals where b >= c. It returns the indices that
+    would sort the input list in the above manner.
     '''
     
     n_rs_pair = round(num_ao*(num_ao+1)/2)
@@ -1432,6 +1457,12 @@ def int2e_ao2mo_kbbb(mo_coeff, int2e_ao, pw_num):
 
     '''
     Transforms kbbb 2e integrals from AO to MO representation.
+
+    int2e_ao:
+      A list of INT2e objects of the type 'kbbb', i.e (P_k G_a|G_b G_c). The elements of the
+      list must be ordered so that c varies the fastest, then b, then a, then k. Only independent
+      elements should be present such that k, a, and b are full range, while c<=b. Use sort_kbbb
+      to ensure that int2e_ao is sorted in that manner.
     '''
     
     ao_num, mo_num = mo_coeff.shape
