@@ -384,6 +384,41 @@ def ao_pw_pot(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0) -> np.ndarr
     return pw_norm * ao_pw
         
 
+def ao_pw_dipole(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0) -> np.ndarray:
+    num_pw = pw_k.shape[0]
+    ao_pw = np.zeros((3, mol.nao_nr(), num_pw), dtype=complex)
+    ao_loc = mol.ao_loc_nr()
+
+    for shell_id in range(mol.nbas):
+        angular = mol.bas_angular(shell_id)
+        atom_id = mol.bas_atom(shell_id)
+        center = np.asarray(mol.atom_coord(atom_id), dtype=float)
+        exponents = np.asarray(mol.bas_exp(shell_id), dtype=float)
+        coefficients = np.asarray(mol.bas_ctr_coeff(shell_id), dtype=float)
+        coefficients *= gto.gto_norm(angular, exponents)[:, None]
+
+        powers_list = _cartesian_powers(angular)
+        shell_cart = np.zeros((3, len(powers_list), coefficients.shape[1], num_pw), dtype=complex)
+        for prim_id, alpha in enumerate(exponents):
+            for cart_id, powers in enumerate(powers_list):
+                base = primitive_pw_moment(alpha, center, powers, pw_k)
+                shifted_powers = (
+                    (powers[0] + 1, powers[1], powers[2]),
+                    (powers[0], powers[1] + 1, powers[2]),
+                    (powers[0], powers[1], powers[2] + 1),
+                )
+                for axis, axis_powers in enumerate(shifted_powers):
+                    prim = primitive_pw_moment(alpha, center, axis_powers, pw_k)
+                    prim += center[axis] * base
+                    shell_cart[axis, cart_id] += coefficients[prim_id, :, None] * prim[None, :]
+
+        start, stop = int(ao_loc[shell_id]), int(ao_loc[shell_id + 1])
+        for axis in range(3):
+            ao_pw[axis, start:stop] = _to_mol_shell_order(angular, shell_cart[axis])
+    
+    return pw_norm * ao_pw
+
+
 def int_1e(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0, op: str = "i") -> np.ndarray:
     '''
     calculate the integral of the plane wave with the Gaussian basis functions
@@ -449,46 +484,13 @@ def int_1e(mol: gto.Mole, pw_k: np.ndarray, pw_norm: float = 1.0, op: str = "i")
         return pot
 
     def _int_dip() -> np.ndarray:
-        def _ao_pw_dipole() -> np.ndarray:
-            ao_pw = np.zeros((3, num_ao, num_pw), dtype=complex)
-            ao_loc = mol.ao_loc_nr()
-
-            for shell_id in range(mol.nbas):
-                angular = mol.bas_angular(shell_id)
-                atom_id = mol.bas_atom(shell_id)
-                center = np.asarray(mol.atom_coord(atom_id), dtype=float)
-                exponents = np.asarray(mol.bas_exp(shell_id), dtype=float)
-                coefficients = np.asarray(mol.bas_ctr_coeff(shell_id), dtype=float)
-                coefficients *= gto.gto_norm(angular, exponents)[:, None]
-    
-                powers_list = _cartesian_powers(angular)
-                shell_cart = np.zeros((3, len(powers_list), coefficients.shape[1], num_pw), dtype=complex)
-                for prim_id, alpha in enumerate(exponents):
-                    for cart_id, powers in enumerate(powers_list):
-                        base = primitive_pw_moment(alpha, center, powers, pw_k)
-                        shifted_powers = (
-                            (powers[0] + 1, powers[1], powers[2]),
-                            (powers[0], powers[1] + 1, powers[2]),
-                            (powers[0], powers[1], powers[2] + 1),
-                        )
-                        for axis, axis_powers in enumerate(shifted_powers):
-                            prim = primitive_pw_moment(alpha, center, axis_powers, pw_k)
-                            prim += center[axis] * base
-                            shell_cart[axis, cart_id] += coefficients[prim_id, :, None] * prim[None, :]
-
-                start, stop = int(ao_loc[shell_id]), int(ao_loc[shell_id + 1])
-                for axis in range(3):
-                    ao_pw[axis, start:stop] = _to_mol_shell_order(angular, shell_cart[axis])
-            
-            return pw_norm * ao_pw
-
         dip = np.zeros((3, num_basis, num_basis), dtype=complex)
 
         dip[:, :num_ao, :num_ao] = mol.intor('int1e_r_sph', comp=3)
 
         # dip[]:, num_ao:, num_ao:] = 0.0
 
-        ao_pw = _ao_pw_dipole()
+        ao_pw = ao_pw_dipole(mol, pw_k, pw_norm)
         dip[:, :num_ao, num_ao:] = ao_pw
         dip[:, num_ao:, :num_ao] = dip[:, :num_ao, num_ao:].conj().transpose(0, 2, 1)
 
